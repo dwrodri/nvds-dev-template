@@ -1,0 +1,21 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${default}",
+                "/usr/include/gstreamer-1.0",
+                "/usr/include/glib-2.0",
+                "/usr/local/cuda/include",
+                "/opt/nvidia/deepstream/deepstream/sources/includes",
+                "/usr/lib/x86_64-linux-gnu/glib-2.0/include"
+            ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "gnu11",
+            "cppStandard": "gnu++14",
+            "intelliSenseMode": "linux-gcc-x64",
+            "configurationProvider": "go2sh.cmake-integration"
+        }
+    ],
+    "version": 4
+}

@@ -1,3 +1,18 @@
+# CMake temp files
+build/
+
+# Reference code from DeepStream applications
+reference_code/
+
+# test media files
+*.mp4
+*.mkv
+*.webm
+
+# GST output
+*.log
+*.dot
+
 # Prerequisites
 *.d
 

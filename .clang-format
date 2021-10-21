@@ -1,0 +1,10 @@
+BasedOnStyle: Google
+IndentWidth: 4
+TabWidth: 4
+AccessModifierOffset: -2
+ConstructorInitializerIndentWidth: 4
+ContinuationIndentWidth: 4
+AlignAfterOpenBracket: Align
+DerivePointerAlignment: false
+PointerAlignment: Left
+ColumnLimit: 88
