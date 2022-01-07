@@ -6,5 +6,5 @@ ConstructorInitializerIndentWidth: 4
 ContinuationIndentWidth: 4
 AlignAfterOpenBracket: Align
 DerivePointerAlignment: false
-PointerAlignment: Left
+PointerAlignment: Right
 ColumnLimit: 88

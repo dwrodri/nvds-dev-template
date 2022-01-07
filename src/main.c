@@ -1,4 +1,3 @@
-
 /*
  * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
  *
@@ -26,28 +25,22 @@
 #include <gst/gst.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
 
 #include "gstnvdsmeta.h"
-//#include "gstnvstreammeta.h"
-#ifndef PLATFORM_TEGRA
-#include "gst-nvmessage.h"
-#endif
 
+#define PGIE_CONFIG_FILE "../pgie_config.txt"
+#define SGIE1_CONFIG_FILE "../sgie1_config.txt"
+#define SGIE2_CONFIG_FILE "../sgie2_config.txt"
+#define SGIE3_CONFIG_FILE "../sgie3_config.txt"
 #define MAX_DISPLAY_LEN 64
+
+#define TRACKER_CONFIG_FILE "../tracker_config.txt"
+#define MAX_TRACKING_ID_LEN 16
 
 #define PGIE_CLASS_ID_VEHICLE 0
 #define PGIE_CLASS_ID_PERSON 2
-
-/* By default, OSD process-mode is set to CPU_MODE. To change mode, set as:
- * 1: GPU mode (for Tesla only)
- * 2: HW mode (For Jetson only)
- */
-#define OSD_PROCESS_MODE 0
-
-/* By default, OSD will not display text. To display text, change this to 1 */
-#define OSD_DISPLAY_TEXT 0
 
 /* The muxer output resolution must be set if the input streams will be of
  * different resolution. The muxer will scale all the input frames to this
@@ -59,61 +52,115 @@
  * based on the fastest source's framerate. */
 #define MUXER_BATCH_TIMEOUT_USEC 40000
 
-#define TILED_OUTPUT_WIDTH 1280
-#define TILED_OUTPUT_HEIGHT 720
+gint frame_number = 0;
+/* These are the strings of the labels for the respective models */
+gchar sgie1_classes_str[12][32] = {"black", "blue",   "brown",  "gold",
+                                   "green", "grey",   "maroon", "orange",
+                                   "red",   "silver", "white",  "yellow"};
 
-/* NVIDIA Decoder source pad memory feature. This feature signifies that source
- * pads having this capability will push GstBuffers containing cuda buffers. */
-#define GST_CAPS_FEATURES_NVMM "memory:NVMM"
+gchar sgie2_classes_str[20][32] = {
+    "Acura", "Audi",     "BMW",     "Chevrolet", "Chrysler", "Dodge",     "Ford",
+    "GMC",   "Honda",    "Hyundai", "Infiniti",  "Jeep",     "Kia",       "Lexus",
+    "Mazda", "Mercedes", "Nissan",  "Subaru",    "Toyota",   "Volkswagen"};
+
+gchar sgie3_classes_str[6][32] = {"coupe", "largevehicle", "sedan",
+                                  "suv",   "truck",        "van"};
 
 gchar pgie_classes_str[4][32] = {"Vehicle", "TwoWheeler", "Person", "RoadSign"};
 
-#define FPS_PRINT_INTERVAL 300
-// static struct timeval start_time = { };
+/* gie_unique_id is one of the properties in the above dstest2_sgiex_config.txt
+ * files. These should be unique and known when we want to parse the Metadata
+ * respective to the sgie labels. Ideally these should be read from the config
+ * files but for brevity we ensure they are same. */
 
-// static guint probe_counter = 0;
+guint sgie1_unique_id = 2;
+guint sgie2_unique_id = 3;
+guint sgie3_unique_id = 4;
 
-/* tiler_sink_pad_buffer_probe  will extract metadata received on OSD sink pad
- * and update params for drawing rectangle, object information etc. */
+/* Wrapper function for handling CUDA runtime calls */
+void cudaCheckError(cudaError_t err) {
+    if (err != cudaSuccess) {
+        g_printerr("%s\n", cudaGetErrorString(err));
+    }
+}
 
-static GstPadProbeReturn tiler_src_pad_buffer_probe(GstPad* pad, GstPadProbeInfo* info,
-                                                    gpointer u_data) {
-    GstBuffer* buf = (GstBuffer*)info->data;
+#define SIZE 64
+static double x_history[SIZE];
+static double avg_x_movement = 0.0;
+double threshold = 5.0;
+static bool is_loitering = FALSE;
+
+double process_history(double buf[SIZE]) {
+    // get pixel deltas
+    for (int i = SIZE - 1; i > 0; i--) {
+        buf[i] = fabs(buf[i] - buf[i - 1]);
+        g_printf("%.1lf\t", buf[i]);
+    }
+    g_printf("\r");
+    // get avg
+    double sum = 0.0;
+    for (int i = 1; i < SIZE; i++) {
+        sum += buf[i];
+    }
+    return sum / ((double)SIZE - 1);
+}
+
+double avg(double buf[SIZE]) {
+    double sum = 0.0;
+    for (int i = 0; i < SIZE; i++) {
+        sum += buf[i];
+    }
+    return sum / ((double)SIZE);
+}
+/* This is the buffer probe function that we have registered on the sink pad
+ * of the OSD element. All the infer elements in the pipeline shall attach
+ * their metadata to the GstBuffer, here we will iterate & process the metadata
+ * forex: class ids to strings, counting of class_id objects etc. */
+static GstPadProbeReturn osd_sink_pad_buffer_probe(GstPad *pad, GstPadProbeInfo *info,
+                                                   gpointer u_data) {
+    GstBuffer *buf = (GstBuffer *)info->data;
     guint num_rects = 0;
-    NvDsObjectMeta* obj_meta = NULL;
-    guint vehicle_count = 0;
-    guint person_count = 0;
-    NvDsMetaList* l_frame = NULL;
-    NvDsMetaList* l_obj = NULL;
-    // NvDsDisplayMeta *display_meta = NULL;
+    NvDsObjectMeta *obj_meta = NULL;
+    NvDsMetaList *l_frame = NULL;
+    NvDsMetaList *l_obj = NULL;
+    NvDsDisplayMeta *display_meta = NULL;
+    double temp;
 
-    NvDsBatchMeta* batch_meta = gst_buffer_get_nvds_batch_meta(buf);
+    NvDsBatchMeta *batch_meta = gst_buffer_get_nvds_batch_meta(buf);
 
     for (l_frame = batch_meta->frame_meta_list; l_frame != NULL;
          l_frame = l_frame->next) {
-        NvDsFrameMeta* frame_meta = (NvDsFrameMeta*)(l_frame->data);
-        // int offset = 0;
+        NvDsFrameMeta *frame_meta = (NvDsFrameMeta *)(l_frame->data);
+        int offset = 0;
         for (l_obj = frame_meta->obj_meta_list; l_obj != NULL; l_obj = l_obj->next) {
-            obj_meta = (NvDsObjectMeta*)(l_obj->data);
+            obj_meta = (NvDsObjectMeta *)(l_obj->data);
             if (obj_meta->class_id == PGIE_CLASS_ID_VEHICLE) {
-                vehicle_count++;
                 num_rects++;
             }
             if (obj_meta->class_id == PGIE_CLASS_ID_PERSON) {
-                person_count++;
                 num_rects++;
+                x_history[frame_meta->frame_num % SIZE] = obj_meta->rect_params.left;
+                temp = obj_meta->rect_params.left;
+
+                if (frame_meta->frame_num % SIZE == 0 &&
+                    frame_meta->frame_num > (SIZE - 1)) {
+                    avg_x_movement = process_history(x_history);
+                    is_loitering = fabs(avg_x_movement) < threshold;
+                }
+                if (is_loitering) {
+                    obj_meta->rect_params.border_color.red = 0.0;
+                    obj_meta->rect_params.border_color.blue = 1.0;
+                }
             }
         }
-        g_print(
-            "Frame Number = %d Number of objects = %d "
-            "Vehicle Count = %d Person Count = %d\n",
-            frame_meta->frame_num, num_rects, vehicle_count, person_count);
-#if 0
         display_meta = nvds_acquire_display_meta_from_pool(batch_meta);
-        NvOSD_TextParams *txt_params  = &display_meta->text_params;
-        txt_params->display_text = g_malloc0 (MAX_DISPLAY_LEN);
-        offset = snprintf(txt_params->display_text, MAX_DISPLAY_LEN, "Person = %d ", person_count);
-        offset = snprintf(txt_params->display_text + offset , MAX_DISPLAY_LEN, "Vehicle = %d ", vehicle_count);
+        NvOSD_TextParams *txt_params = &display_meta->text_params[0];
+        display_meta->num_labels = 1;
+        txt_params->display_text = g_malloc0(MAX_DISPLAY_LEN);
+        offset = snprintf(txt_params->display_text, MAX_DISPLAY_LEN, "left = %lf ",
+                          avg_x_movement);
+        offset = snprintf(txt_params->display_text + offset, MAX_DISPLAY_LEN,
+                          "top = %lf ", temp);
 
         /* Now set the offsets where the string should appear */
         txt_params->x_offset = 10;
@@ -135,32 +182,21 @@ static GstPadProbeReturn tiler_src_pad_buffer_probe(GstPad* pad, GstPadProbeInfo
         txt_params->text_bg_clr.alpha = 1.0;
 
         nvds_add_display_meta_to_frame(frame_meta, display_meta);
-#endif
     }
+
     return GST_PAD_PROBE_OK;
 }
 
-static gboolean bus_call(GstBus* bus, GstMessage* msg, gpointer data) {
-    GMainLoop* loop = (GMainLoop*)data;
+static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer data) {
+    GMainLoop *loop = (GMainLoop *)data;
     switch (GST_MESSAGE_TYPE(msg)) {
         case GST_MESSAGE_EOS:
             g_print("End of stream\n");
             g_main_loop_quit(loop);
             break;
-        case GST_MESSAGE_WARNING: {
-            gchar* debug;
-            GError* error;
-            gst_message_parse_warning(msg, &error, &debug);
-            g_printerr("WARNING from element %s: %s\n", GST_OBJECT_NAME(msg->src),
-                       error->message);
-            g_free(debug);
-            g_printerr("Warning: %s\n", error->message);
-            g_error_free(error);
-            break;
-        }
         case GST_MESSAGE_ERROR: {
-            gchar* debug;
-            GError* error;
+            gchar *debug;
+            GError *error;
             gst_message_parse_error(msg, &error, &debug);
             g_printerr("ERROR from element %s: %s\n", GST_OBJECT_NAME(msg->src),
                        error->message);
@@ -170,135 +206,184 @@ static gboolean bus_call(GstBus* bus, GstMessage* msg, gpointer data) {
             g_main_loop_quit(loop);
             break;
         }
-#ifndef PLATFORM_TEGRA
-        case GST_MESSAGE_ELEMENT: {
-            if (gst_nvmessage_is_stream_eos(msg)) {
-                guint stream_id;
-                if (gst_nvmessage_parse_stream_eos(msg, &stream_id)) {
-                    g_print("Got EOS from stream %d\n", stream_id);
-                }
-            }
-            break;
-        }
-#endif
         default:
             break;
     }
     return TRUE;
 }
 
-static void cb_newpad(GstElement* decodebin, GstPad* decoder_src_pad, gpointer data) {
-    g_print("In cb_newpad\n");
-    GstCaps* caps = gst_pad_get_current_caps(decoder_src_pad);
-    const GstStructure* str = gst_caps_get_structure(caps, 0);
-    const gchar* name = gst_structure_get_name(str);
-    GstElement* source_bin = (GstElement*)data;
-    GstCapsFeatures* features = gst_caps_get_features(caps, 0);
+/* Tracker config parsing */
 
-    /* Need to check if the pad created by the decodebin is for video and not
-     * audio. */
-    if (!strncmp(name, "video", 5)) {
-        /* Link the decodebin pad only if decodebin has picked nvidia
-         * decoder plugin nvdec_*. We do this by checking if the pad caps contain
-         * NVMM memory features. */
-        if (gst_caps_features_contains(features, GST_CAPS_FEATURES_NVMM)) {
-            /* Get the source bin ghost pad */
-            GstPad* bin_ghost_pad = gst_element_get_static_pad(source_bin, "src");
-            if (!gst_ghost_pad_set_target(GST_GHOST_PAD(bin_ghost_pad),
-                                          decoder_src_pad)) {
-                g_printerr("Failed to link decoder src pad to source bin ghost pad\n");
-            }
-            gst_object_unref(bin_ghost_pad);
+#define CHECK_ERROR(error)                                                   \
+    if (error) {                                                             \
+        g_printerr("Error while parsing config file: %s\n", error->message); \
+        goto done;                                                           \
+    }
+
+#define CONFIG_GROUP_TRACKER "tracker"
+#define CONFIG_GROUP_TRACKER_WIDTH "tracker-width"
+#define CONFIG_GROUP_TRACKER_HEIGHT "tracker-height"
+#define CONFIG_GROUP_TRACKER_LL_CONFIG_FILE "ll-config-file"
+#define CONFIG_GROUP_TRACKER_LL_LIB_FILE "ll-lib-file"
+#define CONFIG_GROUP_TRACKER_ENABLE_BATCH_PROCESS "enable-batch-process"
+#define CONFIG_GPU_ID "gpu-id"
+
+// Certain components dynamically generate their sources, so they can't be linked
+// immediately
+static void link_source_pad_to_pipe(GstElement *src, GstPad *new_src_pad,
+                                    GstElement *sink_elem) {
+    GstPad *sink_pad = gst_element_get_static_pad(sink_elem, "sink");
+    g_print("Source Pad was created with name %s\n", gst_pad_get_name(new_src_pad));
+    GstPadLinkReturn status = gst_pad_link(new_src_pad, sink_pad);
+    if (GST_PAD_LINK_FAILED(status)) {
+        g_printerr("Type is %s but link failed",
+                   gst_structure_get_name(gst_caps_get_structure(
+                       gst_pad_get_current_caps(new_src_pad), 0)));
+    }
+}
+
+static gchar *get_absolute_file_path(gchar *cfg_file_path, gchar *file_path) {
+    gchar abs_cfg_path[PATH_MAX + 1];
+    gchar *abs_file_path;
+    gchar *delim;
+
+    if (file_path && file_path[0] == '/') {
+        return file_path;
+    }
+
+    if (!realpath(cfg_file_path, abs_cfg_path)) {
+        g_free(file_path);
+        return NULL;
+    }
+
+    // Return absolute path of config file if file_path is NULL.
+    if (!file_path) {
+        abs_file_path = g_strdup(abs_cfg_path);
+        return abs_file_path;
+    }
+
+    delim = g_strrstr(abs_cfg_path, "/");
+    *(delim + 1) = '\0';
+
+    abs_file_path = g_strconcat(abs_cfg_path, file_path, NULL);
+    g_free(file_path);
+
+    return abs_file_path;
+}
+
+static gboolean set_tracker_properties(GstElement *nvtracker) {
+    gboolean ret = FALSE;
+    GError *error = NULL;
+    gchar **keys = NULL;
+    gchar **key = NULL;
+    GKeyFile *key_file = g_key_file_new();
+
+    if (!g_key_file_load_from_file(key_file, TRACKER_CONFIG_FILE, G_KEY_FILE_NONE,
+                                   &error)) {
+        g_printerr("Failed to load config file: %s\n", error->message);
+        return FALSE;
+    }
+
+    keys = g_key_file_get_keys(key_file, CONFIG_GROUP_TRACKER, NULL, &error);
+    CHECK_ERROR(error);
+
+    for (key = keys; *key; key++) {
+        if (!g_strcmp0(*key, CONFIG_GROUP_TRACKER_WIDTH)) {
+            gint width = g_key_file_get_integer(key_file, CONFIG_GROUP_TRACKER,
+                                                CONFIG_GROUP_TRACKER_WIDTH, &error);
+            CHECK_ERROR(error);
+            g_object_set(G_OBJECT(nvtracker), "tracker-width", width, NULL);
+        } else if (!g_strcmp0(*key, CONFIG_GROUP_TRACKER_HEIGHT)) {
+            gint height = g_key_file_get_integer(key_file, CONFIG_GROUP_TRACKER,
+                                                 CONFIG_GROUP_TRACKER_HEIGHT, &error);
+            CHECK_ERROR(error);
+            g_object_set(G_OBJECT(nvtracker), "tracker-height", height, NULL);
+        } else if (!g_strcmp0(*key, CONFIG_GPU_ID)) {
+            guint gpu_id = g_key_file_get_integer(key_file, CONFIG_GROUP_TRACKER,
+                                                  CONFIG_GPU_ID, &error);
+            CHECK_ERROR(error);
+            g_object_set(G_OBJECT(nvtracker), "gpu_id", gpu_id, NULL);
+        } else if (!g_strcmp0(*key, CONFIG_GROUP_TRACKER_LL_CONFIG_FILE)) {
+            char *ll_config_file = get_absolute_file_path(
+                TRACKER_CONFIG_FILE,
+                g_key_file_get_string(key_file, CONFIG_GROUP_TRACKER,
+                                      CONFIG_GROUP_TRACKER_LL_CONFIG_FILE, &error));
+            CHECK_ERROR(error);
+            g_object_set(G_OBJECT(nvtracker), "ll-config-file", ll_config_file, NULL);
+        } else if (!g_strcmp0(*key, CONFIG_GROUP_TRACKER_LL_LIB_FILE)) {
+            char *ll_lib_file = get_absolute_file_path(
+                TRACKER_CONFIG_FILE,
+                g_key_file_get_string(key_file, CONFIG_GROUP_TRACKER,
+                                      CONFIG_GROUP_TRACKER_LL_LIB_FILE, &error));
+            CHECK_ERROR(error);
+            g_object_set(G_OBJECT(nvtracker), "ll-lib-file", ll_lib_file, NULL);
+        } else if (!g_strcmp0(*key, CONFIG_GROUP_TRACKER_ENABLE_BATCH_PROCESS)) {
+            gboolean enable_batch_process = g_key_file_get_integer(
+                key_file, CONFIG_GROUP_TRACKER,
+                CONFIG_GROUP_TRACKER_ENABLE_BATCH_PROCESS, &error);
+            CHECK_ERROR(error);
+            g_object_set(G_OBJECT(nvtracker), "enable_batch_process",
+                         enable_batch_process, NULL);
         } else {
-            g_printerr("Error: Decodebin did not pick nvidia decoder plugin.\n");
+            g_printerr("Unknown key '%s' for group [%s]", *key, CONFIG_GROUP_TRACKER);
         }
     }
+
+    ret = TRUE;
+done:
+    if (error) {
+        g_error_free(error);
+    }
+    if (keys) {
+        g_strfreev(keys);
+    }
+    if (!ret) {
+        g_printerr("%s failed", __func__);
+    }
+    return ret;
 }
 
-static void decodebin_child_added(GstChildProxy* child_proxy, GObject* object,
-                                  gchar* name, gpointer user_data) {
-    g_print("Decodebin child added: %s\n", name);
-    if (g_strrstr(name, "decodebin") == name) {
-        g_signal_connect(G_OBJECT(object), "child-added",
-                         G_CALLBACK(decodebin_child_added), user_data);
-    }
-}
-
-static GstElement* create_source_bin(guint index, gchar* uri) {
-    GstElement *bin = NULL, *uri_decode_bin = NULL;
-    gchar bin_name[16] = {};
-
-    g_snprintf(bin_name, 15, "source-bin-%02d", index);
-    /* Create a source GstBin to abstract this bin's content from the rest of the
-     * pipeline */
-    bin = gst_bin_new(bin_name);
-
-    /* Source element for reading from the uri.
-     * We will use decodebin and let it figure out the container format of the
-     * stream and the codec and plug the appropriate demux and decode plugins. */
-    uri_decode_bin = gst_element_factory_make("uridecodebin", "uri-decode-bin");
-
-    if (!bin || !uri_decode_bin) {
-        g_printerr("One element in source bin could not be created.\n");
-        return NULL;
-    }
-
-    /* We set the input uri to the source element */
-    g_object_set(G_OBJECT(uri_decode_bin), "uri", uri, NULL);
-
-    /* Connect to the "pad-added" signal of the decodebin which generates a
-     * callback once a new pad for raw data has beed created by the decodebin */
-    g_signal_connect(G_OBJECT(uri_decode_bin), "pad-added", G_CALLBACK(cb_newpad), bin);
-    g_signal_connect(G_OBJECT(uri_decode_bin), "child-added",
-                     G_CALLBACK(decodebin_child_added), bin);
-
-    gst_bin_add(GST_BIN(bin), uri_decode_bin);
-
-    /* We need to create a ghost pad for the source bin which will act as a proxy
-     * for the video decoder src pad. The ghost pad will not have a target right
-     * now. Once the decode bin creates the video decoder and generates the
-     * cb_newpad callback, we will set the ghost pad target to the video decoder
-     * src pad. */
-    if (!gst_element_add_pad(bin, gst_ghost_pad_new_no_target("src", GST_PAD_SRC))) {
-        g_printerr("Failed to add ghost pad in source bin\n");
-        return NULL;
-    }
-
-    return bin;
-}
-
-int main(int argc, char* argv[]) {
-    GMainLoop* loop = NULL;
-    GstElement *pipeline = NULL, *streammux = NULL, *sink = NULL, *pgie = NULL, *queue1,
-               *queue2, *queue3, *queue4, *queue5, *nvvidconv = NULL, *nvosd = NULL,
-               *tiler = NULL;
-    GstElement* transform = NULL;
-    GstBus* bus = NULL;
-    guint bus_watch_id;
-    GstPad* tiler_src_pad = NULL;
-    guint i, num_sources;
-    guint tiler_rows, tiler_columns;
-    guint pgie_batch_size;
+int main(int argc, char *argv[]) {
+    GMainLoop *loop = NULL;
+    GstElement *pipeline = NULL, *source = NULL, *depay = NULL, *h264parser = NULL,
+               *decoder = NULL, *streammux = NULL, *sink = NULL, *pgie = NULL,
+               *nvvidconv = NULL, *nvosd = NULL, *sgie1 = NULL, *sgie2 = NULL,
+               *sgie3 = NULL, *nvtracker = NULL;
+    g_print("With tracker\n");
+    GstElement *transform = NULL;
+    GstBus *bus = NULL;
+    guint bus_watch_id = 0;
+    GstPad *osd_sink_pad = NULL;
 
     int current_device = -1;
-    cudaGetDevice(&current_device);
+    cudaCheckError(cudaGetDevice(&current_device));
     struct cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, current_device);
+    cudaCheckError(cudaGetDeviceProperties(&prop, current_device));
 
     /* Check input arguments */
-    if (argc < 2) {
-        g_printerr("Usage: %s <uri1> [uri2] ... [uriN] \n", argv[0]);
+    if (argc != 2) {
+        g_printerr("Usage: %s <elementary H265 filename>\n", argv[0]);
         return -1;
     }
-    num_sources = argc - 1;
 
     /* Standard GStreamer initialization */
     gst_init(&argc, &argv);
     loop = g_main_loop_new(NULL, FALSE);
 
     /* Create gstreamer elements */
-    /* Create Pipeline element that will form a connection of other elements */
-    pipeline = gst_pipeline_new("dstest3-pipeline");
+
+    /* Create Pipeline element that will be a container of other elements */
+    pipeline = gst_pipeline_new("dstest2-pipeline");
+
+    /* Source element for reading from the RTSP Stream*/
+    source = gst_element_factory_make("rtspsrc", "source");
+
+    depay = gst_element_factory_make("rtph264depay", "depay");
+
+    h264parser = gst_element_factory_make("h264parse", "parser");
+
+    /* Use nvdec_h264 for hardware accelerated decode on GPU */
+    decoder = gst_element_factory_make("nvv4l2decoder", "nvv4l2-decoder");
 
     /* Create nvstreammux instance to form batches from one or more sources. */
     streammux = gst_element_factory_make("nvstreammux", "stream-muxer");
@@ -307,55 +392,22 @@ int main(int argc, char* argv[]) {
         g_printerr("One element could not be created. Exiting.\n");
         return -1;
     }
-    gst_bin_add(GST_BIN(pipeline), streammux);
+    g_print("Got this far\n");
 
-    for (i = 0; i < num_sources; i++) {
-        GstPad *sinkpad, *srcpad;
-        gchar pad_name[16] = {};
-        GstElement* source_bin = create_source_bin(i, argv[i + 1]);
-
-        if (!source_bin) {
-            g_printerr("Failed to create source bin. Exiting.\n");
-            return -1;
-        }
-
-        gst_bin_add(GST_BIN(pipeline), source_bin);
-
-        g_snprintf(pad_name, 15, "sink_%u", i);
-        sinkpad = gst_element_get_request_pad(streammux, pad_name);
-        if (!sinkpad) {
-            g_printerr("Streammux request sink pad failed. Exiting.\n");
-            return -1;
-        }
-
-        srcpad = gst_element_get_static_pad(source_bin, "src");
-        if (!srcpad) {
-            g_printerr("Failed to get src pad of source bin. Exiting.\n");
-            return -1;
-        }
-
-        if (gst_pad_link(srcpad, sinkpad) != GST_PAD_LINK_OK) {
-            g_printerr("Failed to link source bin to stream muxer. Exiting.\n");
-            return -1;
-        }
-
-        gst_object_unref(srcpad);
-        gst_object_unref(sinkpad);
-    }
-
-    /* Use nvinfer to infer on batched frame. */
+    /* Use nvinfer to run inferencing on decoder's output,
+     * behaviour of inferencing is set through config file */
     pgie = gst_element_factory_make("nvinfer", "primary-nvinference-engine");
 
-    /* Add queue elements between every two elements */
-    queue1 = gst_element_factory_make("queue", "queue1");
-    queue2 = gst_element_factory_make("queue", "queue2");
-    queue3 = gst_element_factory_make("queue", "queue3");
-    queue4 = gst_element_factory_make("queue", "queue4");
-    queue5 = gst_element_factory_make("queue", "queue5");
+    /* We need to have a tracker to track the identified objects */
+    nvtracker = gst_element_factory_make("nvtracker", "tracker");
 
-    /* Use nvtiler to composite the batched frames into a 2D tiled array based
-     * on the source of the frames. */
-    tiler = gst_element_factory_make("nvmultistreamtiler", "nvtiler");
+    /* We need three secondary gies so lets create 3 more instances of
+       nvinfer */
+    sgie1 = gst_element_factory_make("nvinfer", "secondary1-nvinference-engine");
+
+    sgie2 = gst_element_factory_make("nvinfer", "secondary2-nvinference-engine");
+
+    sgie3 = gst_element_factory_make("nvinfer", "secondary3-nvinference-engine");
 
     /* Use convertor to convert from NV12 to RGBA as required by nvosd */
     nvvidconv = gst_element_factory_make("nvvideoconvert", "nvvideo-converter");
@@ -369,7 +421,8 @@ int main(int argc, char* argv[]) {
     }
     sink = gst_element_factory_make("nveglglessink", "nvvideo-renderer");
 
-    if (!pgie || !tiler || !nvvidconv || !nvosd || !sink) {
+    if (!source || !depay || !h264parser || !decoder || !pgie || !nvtracker || !sgie1 ||
+        !sgie2 || !sgie3 || !nvvidconv || !nvosd || !sink) {
         g_printerr("One element could not be created. Exiting.\n");
         return -1;
     }
@@ -379,35 +432,29 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    g_object_set(G_OBJECT(streammux), "batch-size", num_sources, NULL);
+    /* Set the input filename to the source element */
+    g_object_set(G_OBJECT(source), "location", argv[1], NULL);
+
+    g_object_set(G_OBJECT(streammux), "batch-size", 1, NULL);
 
     g_object_set(G_OBJECT(streammux), "width", MUXER_OUTPUT_WIDTH, "height",
                  MUXER_OUTPUT_HEIGHT, "batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC,
                  NULL);
 
-    /* Configure the nvinfer element using the nvinfer config file. */
-    g_object_set(G_OBJECT(pgie), "config-file-path", "../pgie_config.txt", NULL);
+    g_signal_connect(source, "pad-added", G_CALLBACK(link_source_pad_to_pipe), depay);
 
-    /* Override the batch-size set in the config file with the number of sources. */
-    g_object_get(G_OBJECT(pgie), "batch-size", &pgie_batch_size, NULL);
-    if (pgie_batch_size != num_sources) {
-        g_printerr(
-            "WARNING: Overriding infer-config batch-size (%d) with number of sources "
-            "(%d)\n",
-            pgie_batch_size, num_sources);
-        g_object_set(G_OBJECT(pgie), "batch-size", num_sources, NULL);
+    /* Set all the necessary properties of the nvinfer element,
+     * the necessary ones are : */
+    g_object_set(G_OBJECT(pgie), "config-file-path", PGIE_CONFIG_FILE, NULL);
+    g_object_set(G_OBJECT(sgie1), "config-file-path", SGIE1_CONFIG_FILE, NULL);
+    g_object_set(G_OBJECT(sgie2), "config-file-path", SGIE2_CONFIG_FILE, NULL);
+    g_object_set(G_OBJECT(sgie3), "config-file-path", SGIE3_CONFIG_FILE, NULL);
+
+    /* Set necessary properties of the tracker element. */
+    if (!set_tracker_properties(nvtracker)) {
+        g_printerr("Failed to set tracker properties. Exiting.\n");
+        return -1;
     }
-
-    tiler_rows = (guint)sqrt(num_sources);
-    tiler_columns = (guint)ceil(1.0 * num_sources / tiler_rows);
-    /* we set the tiler properties here */
-    g_object_set(G_OBJECT(tiler), "rows", tiler_rows, "columns", tiler_columns, "width",
-                 TILED_OUTPUT_WIDTH, "height", TILED_OUTPUT_HEIGHT, NULL);
-
-    g_object_set(G_OBJECT(nvosd), "process-mode", OSD_PROCESS_MODE, "display-text",
-                 OSD_DISPLAY_TEXT, NULL);
-
-    g_object_set(G_OBJECT(sink), "qos", 0, NULL);
 
     /* we add a message handler */
     bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
@@ -416,24 +463,55 @@ int main(int argc, char* argv[]) {
 
     /* Set up the pipeline */
     /* we add all elements into the pipeline */
+    /* decoder | pgie1 | nvtracker | sgie1 | sgie2 | sgie3 | etc.. */
     if (prop.integrated) {
-        gst_bin_add_many(GST_BIN(pipeline), queue1, pgie, queue2, tiler, queue3,
-                         nvvidconv, queue4, nvosd, queue5, transform, sink, NULL);
-        /* we link the elements together
-         * nvstreammux -> nvinfer -> nvtiler -> nvvidconv -> nvosd -> video-renderer */
-        if (!gst_element_link_many(streammux, queue1, pgie, queue2, tiler, queue3,
-                                   nvvidconv, queue4, nvosd, queue5, transform, sink,
-                                   NULL)) {
+        gst_bin_add_many(GST_BIN(pipeline), source, depay, h264parser, decoder,
+                         streammux, pgie, nvtracker, sgie1, sgie2, sgie3, nvvidconv,
+                         nvosd, transform, sink, NULL);
+    } else {
+        gst_bin_add_many(GST_BIN(pipeline), source, depay, h264parser, decoder,
+                         streammux, pgie, nvtracker, sgie1, sgie2, sgie3, nvvidconv,
+                         nvosd, sink, NULL);
+    }
+
+    gchar pad_name_sink[16] = "sink_0";
+    gchar pad_name_src[16] = "src";
+
+    GstPad *sinkpad = gst_element_get_request_pad(streammux, pad_name_sink);
+    if (!sinkpad) {
+        g_printerr("Streammux request sink pad failed. Exiting.\n");
+        return -1;
+    }
+
+    GstPad *srcpad = gst_element_get_static_pad(decoder, pad_name_src);
+    if (!srcpad) {
+        g_printerr("Decoder request src pad failed. Exiting.\n");
+        return -1;
+    }
+
+    if (gst_pad_link(srcpad, sinkpad) != GST_PAD_LINK_OK) {
+        g_printerr("Failed to link decoder to stream muxer. Exiting.\n");
+        return -1;
+    }
+
+    gst_object_unref(sinkpad);
+    gst_object_unref(srcpad);
+
+    /* Link the elements together */
+    if (!gst_element_link_many(depay, h264parser, decoder, NULL)) {
+        g_printerr("Elements could not be linked: 1. Exiting.\n");
+        return -1;
+    }
+
+    if (prop.integrated) {
+        if (!gst_element_link_many(streammux, pgie, nvtracker, sgie1, sgie2, sgie3,
+                                   nvvidconv, nvosd, transform, sink, NULL)) {
             g_printerr("Elements could not be linked. Exiting.\n");
             return -1;
         }
     } else {
-        gst_bin_add_many(GST_BIN(pipeline), queue1, pgie, queue2, tiler, queue3,
-                         nvvidconv, queue4, nvosd, queue5, sink, NULL);
-        /* we link the elements together
-         * nvstreammux -> nvinfer -> nvtiler -> nvvidconv -> nvosd -> video-renderer */
-        if (!gst_element_link_many(streammux, queue1, pgie, queue2, tiler, queue3,
-                                   nvvidconv, queue4, nvosd, queue5, sink, NULL)) {
+        if (!gst_element_link_many(streammux, pgie, nvtracker, sgie1, sgie2, sgie3,
+                                   nvvidconv, nvosd, sink, NULL)) {
             g_printerr("Elements could not be linked. Exiting.\n");
             return -1;
         }
@@ -442,23 +520,19 @@ int main(int argc, char* argv[]) {
     /* Lets add probe to get informed of the meta data generated, we add probe to
      * the sink pad of the osd element, since by that time, the buffer would have
      * had got all the metadata. */
-    tiler_src_pad = gst_element_get_static_pad(pgie, "src");
-    if (!tiler_src_pad)
-        g_print("Unable to get src pad\n");
+    osd_sink_pad = gst_element_get_static_pad(nvosd, "sink");
+    if (!osd_sink_pad)
+        g_print("Unable to get sink pad\n");
     else
-        gst_pad_add_probe(tiler_src_pad, GST_PAD_PROBE_TYPE_BUFFER,
-                          tiler_src_pad_buffer_probe, NULL, NULL);
-    gst_object_unref(tiler_src_pad);
+        gst_pad_add_probe(osd_sink_pad, GST_PAD_PROBE_TYPE_BUFFER,
+                          osd_sink_pad_buffer_probe, NULL, NULL);
+    gst_object_unref(osd_sink_pad);
 
     /* Set the pipeline to "playing" state */
-    g_print("Now playing:");
-    for (i = 0; i < num_sources; i++) {
-        g_print(" %s,", argv[i + 1]);
-    }
-    g_print("\n");
+    g_print("Now playing: %s\n", argv[1]);
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
 
-    /* Wait till pipeline encounters an error or EOS */
+    /* Iterate */
     g_print("Running...\n");
     g_main_loop_run(loop);
 
